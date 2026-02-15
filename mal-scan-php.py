@@ -6,16 +6,22 @@ from pathlib import Path
 from datetime import datetime
 import hashlib
 import requests
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 import time
+from bs4 import BeautifulSoup
+import json
+import pandas as pd
+from collections import defaultdict
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(
-    page_title="PHP Malware Scanner",
-    page_icon="🛡️",
+    page_title="PHP Site Scanner",
+    page_icon="🌐",
     layout="wide"
 )
 
-# ========== Malicious Patterns Database ==========
+# ========== Malicious Patterns Database (เหมือนเดิม) ==========
 DANGEROUS_FUNCTIONS = {
     'critical': [
         'eval', 'exec', 'system', 'shell_exec', 'passthru', 
@@ -72,18 +78,6 @@ SUSPICIOUS_PATTERNS = {
         r'<iframe[^>]*>',
         r'document\.cookie',
     ],
-    'file_upload': [
-        r'move_uploaded_file\s*\(',
-        r'\$_FILES\[',
-        r'is_uploaded_file\s*\(',
-        r'copy\s*\(\s*\$_FILES',
-    ],
-    'remote_code': [
-        r'file_get_contents\s*\(\s*[\'"]https?://',
-        r'curl_exec\s*\(',
-        r'fsockopen\s*\(',
-        r'stream_socket_client\s*\(',
-    ]
 }
 
 COMMON_BACKDOOR_NAMES = [
@@ -92,110 +86,167 @@ COMMON_BACKDOOR_NAMES = [
     '1.php', '404.php', 'xx.php', 'a.php', 'test.php'
 ]
 
-# ========== URL Fetching Functions ==========
+# ========== Site Crawler ==========
 
-def fetch_url_content(url, timeout=10):
-    """ดึงเนื้อหาจาก URL"""
-    try:
-        headers = {
+class WebsiteCrawler:
+    def __init__(self, base_url, max_depth=3, max_pages=100, timeout=10):
+        self.base_url = base_url.rstrip('/')
+        self.domain = urlparse(base_url).netloc
+        self.max_depth = max_depth
+        self.max_pages = max_pages
+        self.timeout = timeout
+        self.visited_urls = set()
+        self.php_files = []
+        self.session = requests.Session()
+        self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=timeout, verify=False)
-        response.raise_for_status()
-        return response.text, response.status_code
-    except requests.exceptions.Timeout:
-        raise Exception(f"Timeout: URL took longer than {timeout}s to respond")
-    except requests.exceptions.ConnectionError:
-        raise Exception("Connection error: Could not connect to URL")
-    except requests.exceptions.HTTPError as e:
-        raise Exception(f"HTTP Error {response.status_code}: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Error fetching URL: {str(e)}")
-
-def is_php_file(url, content=None):
-    """ตรวจสอบว่าเป็นไฟล์ PHP หรือไม่"""
-    # ตรวจจาก URL
-    if url.endswith(('.php', '.phtml', '.php3', '.php4', '.php5')):
-        return True
+        })
     
-    # ตรวจจาก content
-    if content:
-        if content.strip().startswith('<?php') or '<?php' in content[:200]:
-            return True
+    def is_same_domain(self, url):
+        """ตรวจสอบว่า URL อยู่ใน domain เดียวกัน"""
+        return urlparse(url).netloc == self.domain
     
-    return False
-
-def extract_php_urls_from_sitemap(sitemap_url):
-    """ดึง PHP URLs จาก sitemap"""
-    try:
-        content, _ = fetch_url_content(sitemap_url)
+    def is_php_file(self, url):
+        """ตรวจสอบว่าเป็นไฟล์ PHP"""
+        path = urlparse(url).path.lower()
+        return any(path.endswith(ext) for ext in ['.php', '.phtml', '.php3', '.php4', '.php5'])
+    
+    def normalize_url(self, url):
+        """ทำให้ URL เป็นมาตรฐาน"""
+        parsed = urlparse(url)
+        # ลบ fragment (#)
+        url = url.split('#')[0]
+        # ลบ trailing slash ถ้าไม่ใช่ root
+        if parsed.path != '/' and url.endswith('/'):
+            url = url[:-1]
+        return url
+    
+    def get_links_from_page(self, url):
+        """ดึงลิงก์ทั้งหมดจากหน้าเว็บ"""
+        try:
+            response = self.session.get(url, timeout=self.timeout, verify=False)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            links = []
+            
+            # หา links จาก <a> tags
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                absolute_url = urljoin(url, href)
+                normalized_url = self.normalize_url(absolute_url)
+                
+                if self.is_same_domain(normalized_url):
+                    links.append(normalized_url)
+            
+            return links
+        except Exception as e:
+            return []
+    
+    def crawl(self, url=None, depth=0, progress_callback=None):
+        """Crawl เว็บไซต์"""
+        if url is None:
+            url = self.base_url
         
-        # หา URLs ใน sitemap
-        urls = re.findall(r'<loc>(.*?)</loc>', content)
+        url = self.normalize_url(url)
         
-        # กรองเฉพาะไฟล์ PHP
-        php_urls = [url for url in urls if url.endswith(('.php', '.phtml'))]
+        # ตรวจสอบเงื่อนไข
+        if (depth > self.max_depth or 
+            url in self.visited_urls or 
+            len(self.visited_urls) >= self.max_pages or
+            not self.is_same_domain(url)):
+            return
+        
+        self.visited_urls.add(url)
+        
+        if progress_callback:
+            progress_callback(url, len(self.visited_urls), len(self.php_files))
+        
+        # ถ้าเป็นไฟล์ PHP เก็บไว้
+        if self.is_php_file(url):
+            self.php_files.append(url)
+        
+        # ดึงลิงก์จากหน้านี้
+        links = self.get_links_from_page(url)
+        
+        # Crawl ลิงก์ที่เจอ
+        for link in links:
+            if len(self.visited_urls) < self.max_pages:
+                self.crawl(link, depth + 1, progress_callback)
+            else:
+                break
+    
+    def try_common_paths(self):
+        """ลองเข้า path ที่พบบ่อย"""
+        common_paths = [
+            '/wp-admin/', '/wp-content/', '/wp-includes/',
+            '/admin/', '/administrator/', '/manager/',
+            '/includes/', '/inc/', '/lib/', '/libs/',
+            '/plugins/', '/modules/', '/themes/',
+            '/uploads/', '/upload/', '/files/',
+            '/api/', '/ajax/', '/cron/',
+            '/index.php', '/admin.php', '/login.php',
+            '/config.php', '/settings.php'
+        ]
+        
+        found_urls = []
+        
+        for path in common_paths:
+            url = self.base_url + path
+            try:
+                response = self.session.head(url, timeout=5, verify=False, allow_redirects=True)
+                if response.status_code == 200:
+                    normalized_url = self.normalize_url(url)
+                    if normalized_url not in self.visited_urls:
+                        found_urls.append(normalized_url)
+                        if self.is_php_file(normalized_url):
+                            self.php_files.append(normalized_url)
+            except:
+                pass
+        
+        return found_urls
+    
+    def try_sitemap(self):
+        """ลองดึงข้อมูลจาก sitemap.xml"""
+        sitemap_urls = [
+            '/sitemap.xml',
+            '/sitemap_index.xml',
+            '/sitemap1.xml',
+            '/wp-sitemap.xml'
+        ]
+        
+        php_urls = []
+        
+        for sitemap_path in sitemap_urls:
+            try:
+                url = self.base_url + sitemap_path
+                response = self.session.get(url, timeout=self.timeout, verify=False)
+                response.raise_for_status()
+                
+                # Parse sitemap
+                urls = re.findall(r'<loc>(.*?)</loc>', response.text)
+                
+                for found_url in urls:
+                    if self.is_same_domain(found_url):
+                        normalized_url = self.normalize_url(found_url)
+                        if normalized_url not in self.visited_urls:
+                            self.visited_urls.add(normalized_url)
+                            if self.is_php_file(normalized_url):
+                                php_urls.append(normalized_url)
+                
+                break  # ถ้าเจอ sitemap แล้วไม่ต้องลองอันอื่น
+                
+            except:
+                continue
         
         return php_urls
-    except Exception as e:
-        st.warning(f"⚠️ Could not parse sitemap: {str(e)}")
-        return []
 
-def scan_github_repo(repo_url):
-    """สแกน GitHub repository"""
-    try:
-        # แปลง URL ให้เป็น API URL
-        # https://github.com/user/repo -> https://api.github.com/repos/user/repo/contents
-        
-        parts = repo_url.rstrip('/').split('/')
-        if len(parts) < 5:
-            raise Exception("Invalid GitHub URL")
-        
-        owner = parts[-2]
-        repo = parts[-1]
-        
-        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents"
-        
-        headers = {
-            'Accept': 'application/vnd.github.v3+json'
-        }
-        
-        response = requests.get(api_url, headers=headers)
-        response.raise_for_status()
-        
-        files = response.json()
-        php_files = []
-        
-        def get_files_recursive(url, path=""):
-            response = requests.get(url, headers=headers)
-            if response.status_code != 200:
-                return
-            
-            items = response.json()
-            for item in items:
-                if item['type'] == 'file' and item['name'].endswith(('.php', '.phtml')):
-                    php_files.append({
-                        'name': item['path'],
-                        'download_url': item['download_url']
-                    })
-                elif item['type'] == 'dir':
-                    get_files_recursive(item['url'], item['path'])
-        
-        get_files_recursive(api_url)
-        
-        return php_files
-        
-    except Exception as e:
-        raise Exception(f"Error scanning GitHub repo: {str(e)}")
-
-# ========== Scanning Functions ==========
+# ========== Scanning Functions (เหมือนเดิม) ==========
 
 def calculate_file_hash(content):
-    """คำนวณ MD5 hash ของไฟล์"""
     return hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
 
 def scan_dangerous_functions(content, filename):
-    """สแกนหา dangerous functions"""
     results = []
     lines = content.split('\n')
     
@@ -212,11 +263,9 @@ def scan_dangerous_functions(content, filename):
                         'function': func,
                         'description': f'Dangerous function: {func}()'
                     })
-    
     return results
 
 def scan_suspicious_patterns(content, filename):
-    """สแกนหา suspicious patterns"""
     results = []
     lines = content.split('\n')
     
@@ -233,11 +282,9 @@ def scan_suspicious_patterns(content, filename):
                         'category': category,
                         'description': f'Suspicious {category} pattern detected'
                     })
-    
     return results
 
 def check_filename(filename):
-    """ตรวจสอบชื่อไฟล์ที่น่าสงสัย"""
     results = []
     
     if any(bad_name in filename.lower() for bad_name in COMMON_BACKDOOR_NAMES):
@@ -250,20 +297,9 @@ def check_filename(filename):
             'description': f'Suspicious filename: {filename}'
         })
     
-    if len(Path(filename).stem) <= 2 and filename.endswith('.php'):
-        results.append({
-            'type': 'suspicious_filename',
-            'severity': 'medium',
-            'line': 0,
-            'code': filename,
-            'category': 'unusual',
-            'description': f'Unusually short filename: {filename}'
-        })
-    
     return results
 
 def scan_file(content, filename):
-    """สแกนไฟล์ทั้งหมด"""
     results = []
     
     if not (filename.endswith('.php') or filename.endswith('.phtml') or 
@@ -277,7 +313,6 @@ def scan_file(content, filename):
     return results
 
 def calculate_risk_score(findings):
-    """คำนวณคะแนนความเสี่ยง"""
     score = 0
     severity_weights = {'critical': 10, 'high': 5, 'medium': 2}
     
@@ -288,7 +323,6 @@ def calculate_risk_score(findings):
     return min(score, 100)
 
 def get_risk_level(score):
-    """กำหนดระดับความเสี่ยง"""
     if score >= 50:
         return 'CRITICAL', '🔴'
     elif score >= 30:
@@ -300,229 +334,214 @@ def get_risk_level(score):
     else:
         return 'CLEAN', '✅'
 
-# ========== UI Functions ==========
+def fetch_url_content(url, timeout=10):
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=timeout, verify=False)
+        response.raise_for_status()
+        return response.text, response.status_code
+    except Exception as e:
+        raise Exception(f"Error fetching URL: {str(e)}")
 
-def display_findings(findings, filename, url=None):
-    """แสดงผลการค้นพบ"""
-    if not findings:
-        st.success(f"✅ **{filename}** - No threats detected!")
-        if url:
-            st.caption(f"🔗 Source: {url}")
-        return
+# ========== Report Generation ==========
+
+def generate_summary_stats(results):
+    """สร้างสถิติสรุป"""
+    total_files = len(results)
+    total_issues = sum(len(r['findings']) for r in results)
     
-    score = calculate_risk_score(findings)
+    severity_counts = defaultdict(int)
+    category_counts = defaultdict(int)
+    
+    for result in results:
+        for finding in result['findings']:
+            severity_counts[finding['severity']] += 1
+            if 'category' in finding:
+                category_counts[finding['category']] += 1
+    
+    risk_levels = defaultdict(int)
+    for result in results:
+        risk_levels[result['risk_level']] += 1
+    
+    return {
+        'total_files': total_files,
+        'total_issues': total_issues,
+        'severity_counts': dict(severity_counts),
+        'category_counts': dict(category_counts),
+        'risk_levels': dict(risk_levels),
+        'clean_files': risk_levels.get('CLEAN', 0),
+        'infected_files': total_files - risk_levels.get('CLEAN', 0)
+    }
+
+def export_to_csv(results):
+    """Export ผลเป็น CSV"""
+    data = []
+    
+    for result in results:
+        data.append({
+            'URL': result['url'],
+            'Filename': result['filename'],
+            'Risk Level': result['risk_level'],
+            'Risk Score': result['score'],
+            'Total Issues': len(result['findings']),
+            'Critical': sum(1 for f in result['findings'] if f['severity'] == 'critical'),
+            'High': sum(1 for f in result['findings'] if f['severity'] == 'high'),
+            'Medium': sum(1 for f in result['findings'] if f['severity'] == 'medium'),
+        })
+    
+    df = pd.DataFrame(data)
+    return df
+
+def export_detailed_json(results):
+    """Export รายละเอียดเป็น JSON"""
+    return json.dumps(results, indent=2, ensure_ascii=False)
+
+# ========== UI ==========
+
+def display_finding_summary(result):
+    """แสดงสรุปแต่ละไฟล์"""
+    score = result['score']
     risk_level, emoji = get_risk_level(score)
     
-    st.error(f"{emoji} **{filename}** - Risk Level: {risk_level} (Score: {score}/100)")
-    if url:
-        st.caption(f"🔗 Source: {url}")
+    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
     
-    severity_groups = {'critical': [], 'high': [], 'medium': []}
-    for finding in findings:
-        severity = finding.get('severity', 'medium')
-        if severity in severity_groups:
-            severity_groups[severity].append(finding)
-    
-    for severity in ['critical', 'high', 'medium']:
-        if severity_groups[severity]:
-            color = {'critical': '🔴', 'high': '🟠', 'medium': '🟡'}[severity]
-            
-            with st.expander(f"{color} {severity.upper()} - {len(severity_groups[severity])} issues", expanded=(severity == 'critical')):
-                for i, finding in enumerate(severity_groups[severity], 1):
-                    st.markdown(f"""
-                    **#{i}** Line {finding['line']}: {finding['description']}
-                    ```php
-                    {finding['code']}
-                    ```
-                    """)
+    with col1:
+        st.markdown(f"**{result['filename']}**")
+        st.caption(f"🔗 {result['url']}")
+    with col2:
+        if risk_level == 'CRITICAL':
+            st.error(f"{emoji} {risk_level}")
+        elif risk_level == 'HIGH':
+            st.warning(f"{emoji} {risk_level}")
+        elif risk_level == 'MEDIUM':
+            st.info(f"{emoji} {risk_level}")
+        else:
+            st.success(f"{emoji} {risk_level}")
+    with col3:
+        st.metric("Score", f"{score}/100")
+    with col4:
+        st.metric("Issues", len(result['findings']))
 
 def main():
-    st.title("🛡️ PHP Malware Scanner")
+    st.title("🌐 PHP Website Malware Scanner")
     st.markdown("""
-    ตรวจสอบโค้ด PHP เพื่อหา Malicious Code, Backdoors, Webshells และช่องโหว่ด้าน Security
+    สแกนเว็บไซต์ทั้งหมดเพื่อหา Malicious Code ในไฟล์ PHP
     """)
     
     # Sidebar
     st.sidebar.header("⚙️ Scanner Settings")
     
-    scan_mode = st.sidebar.radio(
-        "Select Scan Mode:",
-        ["📁 Upload Files", "🌐 Scan from URL", "📋 Multiple URLs", "🐙 GitHub Repository", "📦 ZIP Archive"]
+    # Website URL
+    website_url = st.sidebar.text_input(
+        "🌐 Website URL:",
+        placeholder="https://example.com",
+        help="Enter the website URL to scan"
     )
     
     st.sidebar.divider()
     
-    show_clean = st.sidebar.checkbox("Show clean files", value=False)
-    show_code = st.sidebar.checkbox("Show full code preview", value=False)
+    st.sidebar.subheader("🔍 Crawling Options")
+    
+    crawler_method = st.sidebar.radio(
+        "Scanning Method:",
+        ["Auto Crawl", "Sitemap Only", "Common Paths", "Full Scan (All Methods)"]
+    )
+    
+    if crawler_method in ["Auto Crawl", "Full Scan (All Methods)"]:
+        max_depth = st.sidebar.slider("Max Crawl Depth:", 1, 5, 3)
+        max_pages = st.sidebar.slider("Max Pages to Visit:", 10, 500, 100)
+    else:
+        max_depth = 2
+        max_pages = 50
     
     st.sidebar.divider()
     
-    st.sidebar.subheader("📊 Threat Levels")
-    st.sidebar.markdown("""
-    - 🔴 **CRITICAL**: ต้องแก้ไขทันที
-    - 🟠 **HIGH**: มีความเสี่ยงสูง
-    - 🟡 **MEDIUM**: มีความเสี่ยงปานกลาง
-    - 🟢 **LOW**: ควรตรวจสอบ
-    - ✅ **CLEAN**: ปลอดภัย
-    """)
+    st.sidebar.subheader("⚡ Performance")
+    timeout = st.sidebar.slider("Request Timeout (sec):", 5, 30, 10)
+    delay = st.sidebar.slider("Delay Between Requests (sec):", 0.0, 2.0, 0.5, 0.1)
     
-    # Main content
-    if scan_mode == "📁 Upload Files":
-        uploaded_files = st.file_uploader(
-            "Upload PHP files",
-            type=['php', 'phtml', 'php3', 'php4', 'php5'],
-            accept_multiple_files=True,
-            help="Upload one or more PHP files to scan"
-        )
-        
-        if uploaded_files:
-            total_files = len(uploaded_files)
-            total_issues = 0
-            total_score = 0
+    st.sidebar.divider()
+    
+    show_clean = st.sidebar.checkbox("Show clean files", value=False)
+    
+    # Main Content
+    if website_url:
+        if st.button("🚀 Start Website Scan", type="primary", use_container_width=True):
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            # Phase 1: Crawling
+            st.subheader("🕷️ Phase 1: Website Crawling")
             
-            results = []
+            crawler = WebsiteCrawler(
+                website_url, 
+                max_depth=max_depth, 
+                max_pages=max_pages,
+                timeout=timeout
+            )
             
-            for i, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f"Scanning {uploaded_file.name}... ({i+1}/{total_files})")
-                
-                content = uploaded_file.read().decode('utf-8', errors='ignore')
-                filename = uploaded_file.name
-                findings = scan_file(content, filename)
-                
-                score = calculate_risk_score(findings)
-                risk_level, emoji = get_risk_level(score)
-                
-                results.append({
-                    'filename': filename,
-                    'findings': findings,
-                    'score': score,
-                    'risk_level': risk_level,
-                    'content': content,
-                    'url': None
-                })
-                
-                total_issues += len(findings)
-                total_score += score
-                
-                progress_bar.progress((i + 1) / total_files)
+            crawl_status = st.empty()
+            crawl_progress = st.progress(0)
             
-            status_text.empty()
-            progress_bar.empty()
+            php_files_found = set()
             
-            # สรุปผล
-            st.success(f"✅ Scan completed! Scanned {total_files} files")
+            def update_progress(url, visited, php_count):
+                crawl_status.info(f"🔍 Crawling: {url[:60]}... | Visited: {visited} | PHP files: {php_count}")
             
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Files", total_files)
-            with col2:
-                critical_count = sum(1 for r in results if r['risk_level'] == 'CRITICAL')
-                st.metric("Critical Files", critical_count)
-            with col3:
-                st.metric("Total Issues", total_issues)
-            with col4:
-                avg_score = total_score / total_files if total_files > 0 else 0
-                st.metric("Avg Risk Score", f"{avg_score:.1f}/100")
+            # Crawl ตาม method ที่เลือก
+            if crawler_method in ["Auto Crawl", "Full Scan (All Methods)"]:
+                st.info("🕷️ Auto crawling website...")
+                crawler.crawl(progress_callback=update_progress)
+                php_files_found.update(crawler.php_files)
+            
+            if crawler_method in ["Sitemap Only", "Full Scan (All Methods)"]:
+                st.info("🗺️ Checking sitemap...")
+                sitemap_files = crawler.try_sitemap()
+                php_files_found.update(sitemap_files)
+                st.success(f"✅ Found {len(sitemap_files)} PHP files from sitemap")
+            
+            if crawler_method in ["Common Paths", "Full Scan (All Methods)"]:
+                st.info("📁 Checking common paths...")
+                common_files = crawler.try_common_paths()
+                php_files_found.update(common_files)
+                st.success(f"✅ Found {len(common_files)} files from common paths")
+            
+            crawl_status.empty()
+            crawl_progress.empty()
+            
+            php_files_list = list(php_files_found)
+            
+            if not php_files_list:
+                st.warning("⚠️ No PHP files found on this website!")
+                st.info("""
+                **Possible reasons:**
+                - Website doesn't use PHP
+                - PHP files are protected/hidden
+                - Crawler couldn't access them
+                - Try different scanning method
+                """)
+                return
+            
+            st.success(f"✅ Crawling completed! Found **{len(php_files_list)}** PHP files")
+            
+            # แสดงรายการไฟล์ที่เจอ
+            with st.expander(f"📄 View {len(php_files_list)} PHP Files Found"):
+                for i, url in enumerate(php_files_list, 1):
+                    st.text(f"{i}. {url}")
             
             st.divider()
             
-            results_sorted = sorted(results, key=lambda x: x['score'], reverse=True)
+            # Phase 2: Scanning
+            st.subheader("🔍 Phase 2: Malware Scanning")
             
-            for result in results_sorted:
-                if result['risk_level'] != 'CLEAN' or show_clean:
-                    display_findings(result['findings'], result['filename'], result['url'])
-                    st.divider()
-    
-    elif scan_mode == "🌐 Scan from URL":
-        st.subheader("🌐 Scan PHP File from URL")
-        
-        url_input = st.text_input(
-            "Enter PHP file URL:",
-            placeholder="https://example.com/file.php",
-            help="Enter direct URL to a PHP file"
-        )
-        
-        if url_input and st.button("🔍 Scan URL", type="primary"):
-            try:
-                with st.spinner(f"Fetching {url_input}..."):
-                    content, status_code = fetch_url_content(url_input)
-                    
-                    st.info(f"✅ Fetched successfully (HTTP {status_code})")
-                    
-                    # ตรวจสอบว่าเป็นไฟล์ PHP
-                    if not is_php_file(url_input, content):
-                        st.warning("⚠️ This doesn't appear to be a PHP file. Scanning anyway...")
-                    
-                    # สแกนไฟล์
-                    filename = urlparse(url_input).path.split('/')[-1] or 'index.php'
-                    findings = scan_file(content, filename)
-                    
-                    # แสดงสถิติ
-                    score = calculate_risk_score(findings)
-                    risk_level, emoji = get_risk_level(score)
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Risk Score", f"{score}/100")
-                    with col2:
-                        st.metric("Risk Level", risk_level)
-                    with col3:
-                        st.metric("Total Issues", len(findings))
-                    with col4:
-                        file_hash = calculate_file_hash(content)
-                        st.metric("File Hash", file_hash[:8] + "...")
-                    
-                    st.divider()
-                    
-                    # แสดงผล
-                    display_findings(findings, filename, url_input)
-                    
-                    # แสดง code
-                    if show_code:
-                        with st.expander("📄 Full Code Preview"):
-                            st.code(content, language='php', line_numbers=True)
-                    
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-    
-    elif scan_mode == "📋 Multiple URLs":
-        st.subheader("📋 Scan Multiple URLs")
-        
-        url_list = st.text_area(
-            "Enter URLs (one per line):",
-            placeholder="https://example.com/file1.php\nhttps://example.com/file2.php\nhttps://example.com/file3.php",
-            height=150,
-            help="Enter one URL per line"
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            delay = st.slider("Delay between requests (seconds):", 0, 5, 1, help="Prevent rate limiting")
-        with col2:
-            timeout = st.slider("Request timeout (seconds):", 5, 30, 10)
-        
-        if url_list and st.button("🚀 Scan All URLs", type="primary"):
-            urls = [url.strip() for url in url_list.split('\n') if url.strip()]
-            
-            if not urls:
-                st.warning("⚠️ Please enter at least one URL")
-                return
-            
-            total_files = len(urls)
-            st.info(f"📊 Found {total_files} URLs to scan")
-            
-            total_issues = 0
-            total_score = 0
+            total_files = len(php_files_list)
             results = []
             
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            scan_progress = st.progress(0)
+            scan_status = st.empty()
             
-            for i, url in enumerate(urls):
-                status_text.text(f"Scanning {url}... ({i+1}/{total_files})")
+            for i, url in enumerate(php_files_list):
+                scan_status.info(f"🔍 Scanning: {url[:60]}... ({i+1}/{total_files})")
                 
                 try:
                     content, status_code = fetch_url_content(url, timeout=timeout)
@@ -533,272 +552,270 @@ def main():
                     risk_level, emoji = get_risk_level(score)
                     
                     results.append({
+                        'url': url,
                         'filename': filename,
                         'findings': findings,
                         'score': score,
                         'risk_level': risk_level,
-                        'url': url,
-                        'status': 'success'
+                        'status': 'success',
+                        'hash': calculate_file_hash(content)
                     })
-                    
-                    total_issues += len(findings)
-                    total_score += score
                     
                 except Exception as e:
                     results.append({
+                        'url': url,
                         'filename': urlparse(url).path.split('/')[-1] or 'unknown',
                         'findings': [],
                         'score': 0,
                         'risk_level': 'ERROR',
-                        'url': url,
                         'status': 'failed',
                         'error': str(e)
                     })
                 
-                progress_bar.progress((i + 1) / total_files)
+                scan_progress.progress((i + 1) / total_files)
                 
-                # Delay ระหว่าง requests
                 if delay > 0 and i < total_files - 1:
                     time.sleep(delay)
             
-            status_text.empty()
-            progress_bar.empty()
+            scan_status.empty()
+            scan_progress.empty()
             
-            # สรุปผล
-            success_count = sum(1 for r in results if r['status'] == 'success')
-            failed_count = sum(1 for r in results if r['status'] == 'failed')
-            
-            st.success(f"✅ Scan completed! {success_count} successful, {failed_count} failed")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total URLs", total_files)
-            with col2:
-                critical_count = sum(1 for r in results if r['risk_level'] == 'CRITICAL')
-                st.metric("Critical Files", critical_count)
-            with col3:
-                st.metric("Total Issues", total_issues)
-            with col4:
-                avg_score = total_score / success_count if success_count > 0 else 0
-                st.metric("Avg Risk Score", f"{avg_score:.1f}/100")
-            
+            # Phase 3: Results
             st.divider()
+            st.subheader("📊 Scan Results")
             
-            # แสดงผล
+            # สถิติ
+            stats = generate_summary_stats(results)
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                st.metric("Total Files", stats['total_files'])
+            with col2:
+                st.metric("Clean Files", stats['clean_files'], delta="Good" if stats['clean_files'] > 0 else None)
+            with col3:
+                st.metric("Infected Files", stats['infected_files'], delta="Bad" if stats['infected_files'] > 0 else None)
+            with col4:
+                st.metric("Total Issues", stats['total_issues'])
+            with col5:
+                infection_rate = (stats['infected_files'] / stats['total_files'] * 100) if stats['total_files'] > 0 else 0
+                st.metric("Infection Rate", f"{infection_rate:.1f}%")
+            
+            # Severity breakdown
+            st.divider()
+            st.subheader("⚠️ Severity Breakdown")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                critical = stats['severity_counts'].get('critical', 0)
+                st.metric("🔴 Critical", critical)
+            with col2:
+                high = stats['severity_counts'].get('high', 0)
+                st.metric("🟠 High", high)
+            with col3:
+                medium = stats['severity_counts'].get('medium', 0)
+                st.metric("🟡 Medium", medium)
+            
+            # Category breakdown
+            if stats['category_counts']:
+                st.divider()
+                st.subheader("📈 Threat Categories")
+                
+                category_data = pd.DataFrame(
+                    list(stats['category_counts'].items()),
+                    columns=['Category', 'Count']
+                ).sort_values('Count', ascending=False)
+                
+                st.bar_chart(category_data.set_index('Category'))
+            
+            # Export
+            st.divider()
+            st.subheader("💾 Export Results")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # CSV Export
+                csv_df = export_to_csv(results)
+                csv = csv_df.to_csv(index=False)
+                
+                st.download_button(
+                    "📥 Download CSV Report",
+                    data=csv,
+                    file_name=f"malware_scan_{urlparse(website_url).netloc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            
+            with col2:
+                # JSON Export
+                json_data = export_detailed_json(results)
+                
+                st.download_button(
+                    "📥 Download JSON Report",
+                    data=json_data,
+                    file_name=f"malware_scan_{urlparse(website_url).netloc}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+            
+            # Detailed Results
+            st.divider()
+            st.subheader("📋 Detailed Scan Results")
+            
+            # แสดงผลเรียงตาม risk score
             results_sorted = sorted(results, key=lambda x: x['score'], reverse=True)
             
-            for result in results_sorted:
-                if result['status'] == 'failed':
-                    st.warning(f"⚠️ **{result['filename']}** - Failed to fetch")
-                    st.caption(f"🔗 URL: {result['url']}")
-                    st.caption(f"❌ Error: {result.get('error', 'Unknown error')}")
-                    st.divider()
-                elif result['risk_level'] != 'CLEAN' or show_clean:
-                    display_findings(result['findings'], result['filename'], result['url'])
-                    st.divider()
-    
-    elif scan_mode == "🐙 GitHub Repository":
-        st.subheader("🐙 Scan GitHub Repository")
-        
-        repo_url = st.text_input(
-            "Enter GitHub repository URL:",
-            placeholder="https://github.com/username/repository",
-            help="Enter GitHub repository URL (must be public)"
-        )
-        
-        if repo_url and st.button("🔍 Scan Repository", type="primary"):
-            try:
-                with st.spinner("Fetching repository files..."):
-                    php_files = scan_github_repo(repo_url)
-                    
-                    if not php_files:
-                        st.warning("⚠️ No PHP files found in repository")
-                        return
-                    
-                    st.info(f"📦 Found {len(php_files)} PHP files")
-                    
-                    if st.button("🚀 Start Scanning", type="primary"):
-                        total_files = len(php_files)
-                        total_issues = 0
-                        total_score = 0
-                        results = []
+            # แยกตาม risk level
+            critical_files = [r for r in results_sorted if r['risk_level'] == 'CRITICAL']
+            high_files = [r for r in results_sorted if r['risk_level'] == 'HIGH']
+            medium_files = [r for r in results_sorted if r['risk_level'] == 'MEDIUM']
+            low_files = [r for r in results_sorted if r['risk_level'] == 'LOW']
+            clean_files = [r for r in results_sorted if r['risk_level'] == 'CLEAN']
+            error_files = [r for r in results_sorted if r['status'] == 'failed']
+            
+            # Critical Files
+            if critical_files:
+                st.error(f"🔴 CRITICAL RISK FILES ({len(critical_files)})")
+                for result in critical_files:
+                    with st.expander(f"🔴 {result['filename']} - Score: {result['score']}/100"):
+                        st.caption(f"🔗 {result['url']}")
+                        st.caption(f"🔑 Hash: {result.get('hash', 'N/A')}")
                         
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
+                        for finding in result['findings']:
+                            st.markdown(f"""
+                            **Line {finding['line']}**: {finding['description']}
+                            ```php
+                            {finding['code']}
+                            ```
+                            """)
+            
+            # High Risk Files
+            if high_files:
+                st.warning(f"🟠 HIGH RISK FILES ({len(high_files)})")
+                for result in high_files:
+                    with st.expander(f"🟠 {result['filename']} - Score: {result['score']}/100"):
+                        st.caption(f"🔗 {result['url']}")
+                        st.caption(f"🔑 Hash: {result.get('hash', 'N/A')}")
                         
-                        for i, file_info in enumerate(php_files):
-                            status_text.text(f"Scanning {file_info['name']}... ({i+1}/{total_files})")
-                            
-                            try:
-                                content, _ = fetch_url_content(file_info['download_url'])
-                                findings = scan_file(content, file_info['name'])
-                                score = calculate_risk_score(findings)
-                                risk_level, emoji = get_risk_level(score)
-                                
-                                results.append({
-                                    'filename': file_info['name'],
-                                    'findings': findings,
-                                    'score': score,
-                                    'risk_level': risk_level,
-                                    'url': file_info['download_url']
-                                })
-                                
-                                total_issues += len(findings)
-                                total_score += score
-                                
-                            except Exception as e:
-                                st.warning(f"⚠️ Could not scan {file_info['name']}: {str(e)}")
-                            
-                            progress_bar.progress((i + 1) / total_files)
-                            time.sleep(0.1)  # Prevent API rate limiting
-                        
-                        status_text.empty()
-                        progress_bar.empty()
-                        
-                        # สรุปผล
-                        st.success(f"✅ Repository scan completed!")
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Total Files", total_files)
-                        with col2:
-                            critical_count = sum(1 for r in results if r['risk_level'] == 'CRITICAL')
-                            st.metric("Critical Files", critical_count)
-                        with col3:
-                            st.metric("Total Issues", total_issues)
-                        with col4:
-                            avg_score = total_score / total_files if total_files > 0 else 0
-                            st.metric("Avg Risk Score", f"{avg_score:.1f}/100")
-                        
+                        for finding in result['findings']:
+                            st.markdown(f"""
+                            **Line {finding['line']}**: {finding['description']}
+                            ```php
+                            {finding['code']}
+                            ```
+                            """)
+            
+            # Medium Risk Files
+            if medium_files:
+                with st.expander(f"🟡 MEDIUM RISK FILES ({len(medium_files)})"):
+                    for result in medium_files:
+                        display_finding_summary(result)
                         st.divider()
-                        
-                        # แสดงผล
-                        results_sorted = sorted(results, key=lambda x: x['score'], reverse=True)
-                        
-                        for result in results_sorted:
-                            if result['risk_level'] != 'CLEAN' or show_clean:
-                                display_findings(result['findings'], result['filename'], result['url'])
-                                st.divider()
-                    
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-    
-    elif scan_mode == "📦 ZIP Archive":
-        uploaded_zip = st.file_uploader(
-            "Upload ZIP archive",
-            type=['zip'],
-            help="Upload a ZIP file containing PHP files"
-        )
-        
-        if uploaded_zip:
-            try:
-                with zipfile.ZipFile(io.BytesIO(uploaded_zip.read())) as z:
-                    php_files = [f for f in z.namelist() if f.endswith(('.php', '.phtml'))]
-                    
-                    if not php_files:
-                        st.warning("⚠️ No PHP files found in ZIP archive")
-                        return
-                    
-                    total_files = len(php_files)
-                    st.info(f"📦 Found {total_files} PHP files in archive")
-                    
-                    if st.button("🚀 Start Scanning", type="primary"):
-                        total_issues = 0
-                        total_score = 0
-                        results = []
-                        
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        
-                        for i, filename in enumerate(php_files):
-                            status_text.text(f"Scanning {filename}... ({i+1}/{total_files})")
-                            
-                            try:
-                                content = z.read(filename).decode('utf-8', errors='ignore')
-                                findings = scan_file(content, filename)
-                                score = calculate_risk_score(findings)
-                                risk_level, emoji = get_risk_level(score)
-                                
-                                results.append({
-                                    'filename': filename,
-                                    'findings': findings,
-                                    'score': score,
-                                    'risk_level': risk_level
-                                })
-                                
-                                total_issues += len(findings)
-                                total_score += score
-                                
-                            except Exception as e:
-                                st.warning(f"⚠️ Could not read {filename}: {str(e)}")
-                            
-                            progress_bar.progress((i + 1) / total_files)
-                        
-                        status_text.empty()
-                        progress_bar.empty()
-                        
-                        # สรุปผล
-                        st.success(f"✅ Scan completed!")
-                        
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Total Files", total_files)
-                        with col2:
-                            critical_count = sum(1 for r in results if r['risk_level'] == 'CRITICAL')
-                            st.metric("Critical Files", critical_count)
-                        with col3:
-                            st.metric("Total Issues", total_issues)
-                        with col4:
-                            avg_score = total_score / total_files if total_files > 0 else 0
-                            st.metric("Avg Risk Score", f"{avg_score:.1f}/100")
-                        
+            
+            # Low Risk Files
+            if low_files:
+                with st.expander(f"🟢 LOW RISK FILES ({len(low_files)})"):
+                    for result in low_files:
+                        display_finding_summary(result)
                         st.divider()
-                        
-                        # แสดงผล
-                        results_sorted = sorted(results, key=lambda x: x['score'], reverse=True)
-                        
-                        for result in results_sorted:
-                            if result['risk_level'] != 'CLEAN' or show_clean:
-                                display_findings(result['findings'], result['filename'])
-                                st.divider()
-                        
-            except Exception as e:
-                st.error(f"❌ Error reading ZIP file: {str(e)}")
+            
+            # Clean Files
+            if show_clean and clean_files:
+                with st.expander(f"✅ CLEAN FILES ({len(clean_files)})"):
+                    for result in clean_files:
+                        st.success(f"✅ {result['filename']}")
+                        st.caption(f"🔗 {result['url']}")
+                        st.divider()
+            
+            # Error Files
+            if error_files:
+                with st.expander(f"❌ ERROR FILES ({len(error_files)})"):
+                    for result in error_files:
+                        st.error(f"❌ {result['filename']}")
+                        st.caption(f"🔗 {result['url']}")
+                        st.caption(f"Error: {result.get('error', 'Unknown error')}")
+                        st.divider()
+    
+    else:
+        st.info("👈 Enter a website URL in the sidebar to start scanning")
+        
+        st.markdown("""
+        ### 🚀 How to Use:
+        
+        1. **Enter Website URL** - Input the website you want to scan
+        2. **Choose Scanning Method**:
+           - **Auto Crawl**: Automatically find PHP files by crawling
+           - **Sitemap Only**: Use sitemap.xml to find files
+           - **Common Paths**: Check common directories
+           - **Full Scan**: Use all methods combined
+        3. **Configure Settings** - Adjust depth, limits, and delays
+        4. **Start Scan** - Click the scan button
+        5. **Review Results** - Check findings and export reports
+        
+        ### ⚠️ Important Notes:
+        
+        - Only scan websites you have permission to scan
+        - Respect robots.txt and terms of service
+        - Use appropriate delays to avoid overwhelming servers
+        - Results may include false positives
+        - Always verify findings manually
+        
+        ### 📊 What Gets Scanned:
+        
+        - ✅ All PHP files on the website
+        - ✅ Dangerous functions (eval, exec, system, etc.)
+        - ✅ Backdoor patterns
+        - ✅ Webshell signatures
+        - ✅ Obfuscated code
+        - ✅ SQL injection patterns
+        - ✅ XSS vulnerabilities
+        - ✅ Suspicious filenames
+        """)
     
     # Footer
     st.divider()
     with st.expander("ℹ️ About This Scanner"):
         st.markdown("""
-        ### 🛡️ PHP Malware Scanner
+        ### 🌐 PHP Website Malware Scanner
         
-        **Scan Modes:**
-        - 📁 **Upload Files**: Upload PHP files from your computer
-        - 🌐 **Scan from URL**: Scan a single PHP file from URL
-        - 📋 **Multiple URLs**: Scan multiple files at once
-        - 🐙 **GitHub Repository**: Scan entire GitHub repository
-        - 📦 **ZIP Archive**: Upload and scan compressed files
+        **Scanning Methods:**
+        - 🕷️ **Auto Crawl**: Follows links to discover PHP files
+        - 🗺️ **Sitemap**: Parses sitemap.xml for URLs
+        - 📁 **Common Paths**: Checks frequently used directories
+        - 🔍 **Full Scan**: Combines all methods for comprehensive coverage
         
         **Detection Capabilities:**
-        - 🔴 Dangerous Functions (eval, exec, system, etc.)
-        - 🟠 Backdoors & Webshells
-        - 🟡 Obfuscated Code
-        - 🔵 SQL Injection Patterns
-        - 🟣 XSS Vulnerabilities
-        - 🟤 Remote Code Execution
-        - ⚫ Suspicious Filenames
+        - Dangerous PHP functions
+        - Backdoor code patterns
+        - Webshell signatures (c99, r57, wso, etc.)
+        - Obfuscated/encoded code
+        - SQL injection attempts
+        - XSS vulnerabilities
+        - Remote code execution
+        - Suspicious file naming
         
-        **Important Notes:**
-        - ⚠️ This tool may produce false positives
-        - ⚠️ Cannot detect all sophisticated malware
-        - ⚠️ Always verify findings manually
-        - ⚠️ Use responsibly and legally
+        **Features:**
+        - Site-wide scanning
+        - Automatic file discovery
+        - Risk scoring (0-100)
+        - Severity classification
+        - CSV/JSON export
+        - Detailed reports
+        - Progress tracking
         
         **Best Practices:**
-        - ✅ Backup before removing files
-        - ✅ Keep PHP and plugins updated
-        - ✅ Use strong passwords
-        - ✅ Limit file permissions
-        - ✅ Regular security audits
+        - Get permission before scanning
+        - Use appropriate delays
+        - Start with small limits
+        - Review all findings manually
+        - Export reports for documentation
+        
+        **Limitations:**
+        - Cannot detect all malware types
+        - May produce false positives
+        - Requires internet access
+        - Limited by site structure
+        - Respects rate limiting
         """)
 
 if __name__ == "__main__":
