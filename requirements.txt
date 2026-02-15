@@ -2,3 +2,4 @@ pyqrcode
 pypng
 pillow
 streamlit
+qrcode
