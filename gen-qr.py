@@ -1,132 +1,186 @@
 import streamlit as st
-try:
-    import qrcode
-    from PIL import Image, ImageDraw
-except ImportError as e:
-    st.error(f"Missing required package: {e}")
-    st.info("Please ensure requirements.txt contains: streamlit, qrcode, pillow")
-    st.stop()
-
+import segno
+from PIL import Image
 import io
 
 st.set_page_config(page_title="QR Code Generator", page_icon="🔲", layout="wide")
 
-def generate_qr_code(url, fill_color, back_color, logo=None, logo_size=0.3):
+def generate_qr_code(url, dark_color, light_color, logo=None, scale=10):
     """Generate QR code with custom colors and optional logo"""
     
-    # Create QR code instance
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=10,
-        border=4,
-    )
+    # Convert hex colors to RGB tuples
+    dark_rgb = tuple(int(dark_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+    light_rgb = tuple(int(light_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
     
-    # Add data
-    qr.add_data(url)
-    qr.make(fit=True)
+    # Create QR code
+    qr = segno.make(url, error='h', boost_error=False)
     
-    # Create QR code image with custom colors
-    img = qr.make_image(fill_color=fill_color, back_color=back_color)
-    img = img.convert('RGB')
+    # Save to buffer
+    buff = io.BytesIO()
+    qr.save(buff, kind='png', scale=scale, dark=dark_rgb, light=light_rgb)
+    buff.seek(0)
+    
+    # Load as PIL Image
+    img = Image.open(buff)
     
     # Add logo if provided
     if logo is not None:
+        # Get QR code dimensions
         qr_width, qr_height = img.size
-        logo_max_size = int(qr_width * logo_size)
         
-        # Resize logo
-        logo.thumbnail((logo_max_size, logo_max_size), Image.Resampling.LANCZOS)
+        # Calculate logo size (20-30% of QR code)
+        logo_size = int(qr_width * 0.25)
         
-        # Create white background for logo
-        logo_bg_size = int(logo_max_size * 1.1)
-        logo_bg = Image.new('RGB', (logo_bg_size, logo_bg_size), 'white')
+        # Resize logo maintaining aspect ratio
+        logo.thumbnail((logo_size, logo_size), Image.Resampling.LANCZOS)
         
-        # Paste logo on white background
-        logo_pos = ((logo_bg_size - logo.width) // 2, (logo_bg_size - logo.height) // 2)
-        logo_bg.paste(logo, logo_pos, logo if logo.mode == 'RGBA' else None)
+        # Create white background slightly larger than logo
+        bg_size = int(logo_size * 1.15)
+        logo_bg = Image.new('RGB', (bg_size, bg_size), 'white')
         
-        # Position logo in center
-        logo_pos = ((qr_width - logo_bg_size) // 2, (qr_height - logo_bg_size) // 2)
-        img.paste(logo_bg, logo_pos)
+        # Center logo on white background
+        logo_pos = ((bg_size - logo.width) // 2, (bg_size - logo.height) // 2)
+        
+        # Handle transparency
+        if logo.mode == 'RGBA':
+            logo_bg.paste(logo, logo_pos, logo)
+        else:
+            logo_bg.paste(logo, logo_pos)
+        
+        # Center position for logo on QR code
+        qr_logo_pos = ((qr_width - bg_size) // 2, (qr_height - bg_size) // 2)
+        
+        # Paste logo onto QR code
+        img.paste(logo_bg, qr_logo_pos)
     
     return img
 
 def main():
     st.title("🔲 QR Code Generator")
-    st.markdown("Generate customized QR codes with colors and logos")
+    st.markdown("Generate custom QR codes with colors and logos")
     
+    # Sidebar for settings
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        
+        url = st.text_input(
+            "🔗 Enter URL:",
+            value="https://www.example.com",
+            help="The URL to encode in the QR code"
+        )
+        
+        st.divider()
+        
+        st.subheader("🎨 Colors")
+        dark_color = st.color_picker("QR Code Color (Dark):", "#000000")
+        light_color = st.color_picker("Background Color (Light):", "#FFFFFF")
+        
+        st.divider()
+        
+        st.subheader("🖼️ Logo")
+        logo_file = st.file_uploader(
+            "Upload Logo (Optional):",
+            type=['png', 'jpg', 'jpeg', 'gif'],
+            help="Add a logo to the center of your QR code"
+        )
+        
+        st.divider()
+        
+        scale = st.slider(
+            "QR Code Size:",
+            min_value=5,
+            max_value=20,
+            value=10,
+            help="Adjust the size of the generated QR code"
+        )
+    
+    # Main area
     col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.header("⚙️ Settings")
-        
-        url = st.text_input("🔗 Enter URL:", value="https://www.example.com", 
-                           help="Enter the URL you want to encode")
-        
-        st.subheader("🎨 Colors")
-        fill_color = st.color_picker("QR Code Color:", "#000000")
-        back_color = st.color_picker("Background Color:", "#FFFFFF")
-        
-        st.subheader("🖼️ Logo (Optional)")
-        logo_file = st.file_uploader("Upload logo:", 
-                                     type=['png', 'jpg', 'jpeg'])
-        
-        if logo_file:
-            logo_size = st.slider("Logo Size:", 0.1, 0.5, 0.3, 0.05)
-        else:
-            logo_size = 0.3
-        
-        generate_btn = st.button("✨ Generate QR Code", type="primary", use_container_width=True)
-    
-    with col2:
         st.header("📱 Preview")
         
-        if generate_btn or url:
+        if url:
+            try:
+                # Load logo if uploaded
+                logo = None
+                if logo_file is not None:
+                    logo = Image.open(logo_file)
+                
+                # Generate QR code
+                with st.spinner("Generating QR code..."):
+                    qr_img = generate_qr_code(url, dark_color, light_color, logo, scale)
+                
+                # Display
+                st.image(qr_img, use_container_width=True)
+                
+                st.success("✅ QR code generated successfully!")
+                
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+                st.info("Please check your URL and try again.")
+        else:
+            st.info("👈 Enter a URL in the sidebar to generate a QR code")
+    
+    with col2:
+        st.header("💾 Download")
+        
+        if url:
             try:
                 logo = None
                 if logo_file is not None:
                     logo = Image.open(logo_file)
                 
-                with st.spinner("Generating QR code..."):
-                    qr_img = generate_qr_code(url, fill_color, back_color, logo, logo_size)
+                qr_img = generate_qr_code(url, dark_color, light_color, logo, scale)
                 
-                st.image(qr_img, caption="Your QR Code", use_container_width=True)
-                
-                # Download
+                # Convert to bytes
                 buf = io.BytesIO()
                 qr_img.save(buf, format="PNG")
                 byte_im = buf.getvalue()
                 
+                # Download button
                 st.download_button(
-                    label="📥 Download QR Code (PNG)",
+                    label="📥 Download QR Code",
                     data=byte_im,
                     file_name="qr_code.png",
                     mime="image/png",
                     use_container_width=True
                 )
                 
-                st.success("✅ QR code generated successfully!")
+                # Show info
+                st.info(f"""
+                **QR Code Info:**
+                - Size: {qr_img.width} x {qr_img.height} pixels
+                - URL: {url}
+                - Has Logo: {'Yes' if logo_file else 'No'}
+                """)
                 
             except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
-                st.info("Please check your inputs and try again.")
+                st.error(f"Error: {e}")
     
-    st.markdown("---")
-    with st.expander("📖 Instructions"):
+    # Footer
+    st.divider()
+    
+    with st.expander("📖 How to Use"):
         st.markdown("""
-        ### How to use:
-        1. **Enter URL** - Type the web address you want to encode
-        2. **Choose Colors** - Customize foreground and background colors
-        3. **Add Logo** (Optional) - Upload your brand logo
-        4. **Generate** - Click the button to create your QR code
-        5. **Download** - Save the QR code as PNG
+        ### Steps:
+        1. **Enter URL** - Input the website address in the sidebar
+        2. **Customize Colors** - Choose your brand colors
+        3. **Add Logo** (Optional) - Upload an image file
+        4. **Adjust Size** - Use the slider to change QR code dimensions
+        5. **Download** - Click the download button to save
+        
+        ### Best Practices:
+        - ✅ Use **high contrast** colors (e.g., black on white)
+        - ✅ Test your QR code with multiple scanners
+        - ✅ Keep URLs short for simpler QR codes
+        - ✅ Logo should be **20-30%** of QR code size
+        - ✅ Use PNG format for best quality
         
         ### Tips:
-        - ✅ Use high contrast colors (dark on light or vice versa)
-        - ✅ Keep logo size between 20-30% for best results
-        - ✅ Always test the QR code before printing
-        - ✅ Higher error correction allows logos without affecting scanning
+        - Logos work best with high error correction
+        - Always test before printing in bulk
+        - QR codes work best at 2cm x 2cm minimum size
         """)
 
 if __name__ == "__main__":
