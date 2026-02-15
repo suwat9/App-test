@@ -1,5 +1,12 @@
-pyqrcode
-pypng
-pillow
 streamlit
-qrcode
+requests
+beautifulsoup4
+pandas
+urllib3
+
+# for qrcode program
+# pyqrcode
+# pypng
+# pillow
+# streamlit
+# qrcode
