@@ -4,8 +4,8 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import math
-import plotly.express as px
-import plotly.graph_objects as go
+import json
+import io
 
 # ตั้งค่าหน้าเว็บ
 st.set_page_config(
@@ -30,10 +30,9 @@ class WorkTimeTracker:
             'work_sessions': [],
             'is_tracking': False,
             'current_location': None,
-            'last_update': None,
-            'use_gps': False,
             'manual_lat': 13.7563,
-            'manual_lng': 100.5018
+            'manual_lng': 100.5018,
+            'location_method': 'simulation'
         }
         
         for key, value in defaults.items():
@@ -61,23 +60,15 @@ class WorkTimeTracker:
         return distance
 
     def get_current_location(self):
-        """ดึงตำแหน่งปัจจุบัน - ใช้ manual input หรือ simulation"""
-        if st.session_state.use_gps:
-            # พยายามใช้ GPS จริง (ถ้ามี)
-            try:
-                # วิธีนี้จะทำงานเมื่อผู้ใช้อนุญาต GPS
-                # สำหรับตอนนี้ให้ใช้ manual input เป็นหลัก
-                if st.session_state.current_location:
-                    return st.session_state.current_location
-            except:
-                st.session_state.use_gps = False
-                st.warning("GPS ไม่พร้อมใช้งาน ใช้ตำแหน่งจำลองแทน")
+        """ดึงตำแหน่งปัจจุบัน"""
+        if st.session_state.location_method == 'manual':
+            return (st.session_state.manual_lat, st.session_state.manual_lng)
         
-        # ใช้ตำแหน่งจำลองหรือ manual input
+        # Simulation mode - สุ่มตำแหน่งรอบพื้นที่ทำงาน
         if (st.session_state.current_location is None or 
-            (datetime.now() - st.session_state.last_update).seconds > 30):
+            (datetime.now() - getattr(st.session_state, 'last_update', datetime.now())).seconds > 30):
             
-            # สุ่มตำแหน่งรอบพื้นที่ทำงานสำหรับ simulation
+            # สุ่มตำแหน่งรอบพื้นที่ทำงาน
             variation = 0.002  # ~200 เมตร
             lat = st.session_state.work_location['lat'] + np.random.uniform(-variation, variation)
             lng = st.session_state.work_location['lng'] + np.random.uniform(-variation, variation)
@@ -120,12 +111,6 @@ class WorkTimeTracker:
         st.session_state.work_sessions.append(new_session)
         st.session_state.is_tracking = True
         
-        # แสดงสถานะ
-        if in_area:
-            st.success("✅ เริ่มบันทึกเวลาทำงานแล้ว - อยู่ในพื้นที่ทำงาน")
-        else:
-            st.warning("⚠️ เริ่มบันทึกเวลาทำงานแล้ว - นอกพื้นที่ทำงาน")
-        
         return True
 
     def end_work_session(self):
@@ -133,7 +118,6 @@ class WorkTimeTracker:
         active_sessions = [s for s in st.session_state.work_sessions if s['status'] == 'active']
         
         if not active_sessions:
-            st.warning("ไม่มี session การทำงานที่กำลังดำเนินอยู่")
             return False
             
         # หยุด session ล่าสุดที่ active
@@ -148,118 +132,7 @@ class WorkTimeTracker:
                 break
         
         st.session_state.is_tracking = False
-        st.success("⏹️ หยุดบันทึกเวลาทำงานแล้ว")
         return True
-
-    def render_sidebar(self):
-        """แสดง sidebar"""
-        with st.sidebar:
-            st.title("⚙️ การตั้งค่า")
-            
-            # การตั้งค่าตำแหน่ง
-            st.subheader("📍 การตั้งค่าตำแหน่ง")
-            
-            # ตัวเลือกการได้มาซึ่งตำแหน่ง
-            gps_option = st.radio(
-                "วิธีการได้ตำแหน่ง:",
-                ["ตำแหน่งจำลอง", "ป้อนตำแหน่งเอง"],
-                index=0
-            )
-            
-            if gps_option == "ป้อนตำแหน่งเอง":
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.session_state.manual_lat = st.number_input(
-                        "ละติจูด", 
-                        value=st.session_state.manual_lat,
-                        format="%.6f"
-                    )
-                with col2:
-                    st.session_state.manual_lng = st.number_input(
-                        "ลองจิจูด",
-                        value=st.session_state.manual_lng,
-                        format="%.6f"
-                    )
-                
-                if st.button("ใช้ตำแหน่งนี้"):
-                    st.session_state.current_location = (st.session_state.manual_lat, st.session_state.manual_lng)
-                    st.session_state.last_update = datetime.now()
-                    st.success("อัพเดทตำแหน่งเรียบร้อย!")
-            
-            # ตั้งค่าพื้นที่ทำงาน
-            st.subheader("🏢 ตั้งค่าพื้นที่ทำงาน")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                new_lat = st.number_input(
-                    "ละติจูดพื้นที่ทำงาน", 
-                    value=st.session_state.work_location['lat'],
-                    format="%.6f",
-                    key="work_lat"
-                )
-            with col2:
-                new_lng = st.number_input(
-                    "ลองจิจูดพื้นที่ทำงาน",
-                    value=st.session_state.work_location['lng'],
-                    format="%.6f",
-                    key="work_lng"
-                )
-            
-            new_radius = st.slider(
-                "รัศมีพื้นที่ทำงาน (เมตร)",
-                min_value=10,
-                max_value=500,
-                value=st.session_state.work_location['radius']
-            )
-            
-            work_name = st.text_input(
-                "ชื่อสถานที่ทำงาน",
-                value=st.session_state.work_location['name']
-            )
-            
-            if st.button("💾 บันทึกการตั้งค่า", use_container_width=True):
-                st.session_state.work_location.update({
-                    'lat': new_lat,
-                    'lng': new_lng,
-                    'radius': new_radius,
-                    'name': work_name
-                })
-                st.success("บันทึกการตั้งค่าเรียบร้อย!")
-            
-            st.divider()
-            
-            # การควบคุม
-            st.subheader("🎮 การควบคุม")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if not st.session_state.is_tracking:
-                    if st.button("🚀 เริ่มทำงาน", type="primary", use_container_width=True):
-                        self.start_work_session()
-                        st.rerun()
-                else:
-                    st.button("🚀 เริ่มทำงาน", disabled=True, use_container_width=True)
-            
-            with col2:
-                if st.session_state.is_tracking:
-                    if st.button("⏹️ หยุดทำงาน", type="secondary", use_container_width=True):
-                        self.end_work_session()
-                        st.rerun()
-                else:
-                    st.button("⏹️ หยุดทำงาน", disabled=True, use_container_width=True)
-            
-            if st.button("🔄 อัพเดทตำแหน่ง", use_container_width=True):
-                st.session_state.current_location = None
-                st.rerun()
-            
-            st.divider()
-            
-            # สถิติ
-            st.subheader("📊 สถิติ")
-            stats = self.get_statistics()
-            st.metric("เวลาวันนี้", f"{stats['today_hours']:.2f} ชม.")
-            st.metric("เวลารวม", f"{stats['total_hours']:.2f} ชม.")
-            st.metric("จำนวนครั้ง", stats['total_sessions'])
 
     def get_statistics(self):
         """คำนวณสถิติ"""
@@ -281,9 +154,9 @@ class WorkTimeTracker:
             'total_sessions': len(completed)
         }
 
-    def render_main_content(self):
-        """แสดงเนื้อหาหลัก"""
-        st.title("🏢 ระบบบันทึกเวลาปฏิบัติงาน")
+    def render_header(self):
+        """แสดง header"""
+        st.title("🏢 ระบบบันทึกเวลาปฏิบัติงานด้วย GPS")
         st.markdown("---")
         
         # สถานะปัจจุบัน
@@ -291,15 +164,15 @@ class WorkTimeTracker:
         
         with col1:
             if st.session_state.is_tracking:
-                st.success("🟢 กำลังบันทึกเวลา")
+                st.success("🟢 **กำลังบันทึกเวลา**")
                 # คำนวณเวลาที่ผ่านไป
                 active_session = next((s for s in st.session_state.work_sessions if s['status'] == 'active'), None)
                 if active_session:
                     elapsed = datetime.now() - active_session['start_time']
                     hours = elapsed.total_seconds() / 3600
-                    st.metric("เวลาที่ผ่านไป", f"{hours:.2f} ชม.")
+                    st.write(f"⏱️ เวลาที่ผ่านไป: **{hours:.2f} ชม.**")
             else:
-                st.info("🔴 ไม่ได้บันทึกเวลา")
+                st.info("🔴 **ไม่ได้บันทึกเวลา**")
         
         with col2:
             location = self.get_current_location()
@@ -307,88 +180,206 @@ class WorkTimeTracker:
                 lat, lng = location
                 in_area, distance = self.is_in_work_area(lat, lng)
                 
-                status = "✅ ในพื้นที่" if in_area else "⚠️ นอกพื้นที่"
-                st.metric("สถานะพื้นที่", status)
-                st.metric("ระยะทาง", f"{distance:.0f} เมตร")
+                status_emoji = "✅" if in_area else "⚠️"
+                status_text = "อยู่ในพื้นที่" if in_area else "นอกพื้นที่"
+                st.write(f"{status_emoji} **สถานะพื้นที่:** {status_text}")
+                st.write(f"📏 **ระยะทาง:** {distance:.0f} เมตร")
         
         with col3:
             if location:
-                st.metric("ตำแหน่งปัจจุบัน", f"{lat:.6f}, {lng:.6f}")
-        
-        # แสดงแผนที่
-        self.render_map()
-        
-        # แสดงประวัติการทำงาน
-        st.subheader("📋 ประวัติการทำงาน")
-        self.render_sessions_table()
-        
-        # การวิเคราะห์ข้อมูล
-        st.subheader("📈 การวิเคราะห์")
-        self.render_analytics()
+                st.write("📍 **ตำแหน่งปัจจุบัน:**")
+                st.write(f"ละติจูด: {lat:.6f}")
+                st.write(f"ลองจิจูด: {lng:.6f}")
 
-    def render_map(self):
-        """แสดงแผนที่แบบง่าย"""
-        if not st.session_state.current_location:
+    def render_sidebar(self):
+        """แสดง sidebar"""
+        with st.sidebar:
+            st.header("⚙️ การตั้งค่า")
+            
+            # การตั้งค่าตำแหน่ง
+            st.subheader("📍 วิธีการกำหนดตำแหน่ง")
+            location_method = st.radio(
+                "เลือกวิธีการ:",
+                ["ตำแหน่งจำลอง", "ป้อนตำแหน่งเอง"],
+                index=0 if st.session_state.location_method == 'simulation' else 1
+            )
+            
+            st.session_state.location_method = 'simulation' if location_method == "ตำแหน่งจำลอง" else 'manual'
+            
+            if location_method == "ป้อนตำแหน่งเอง":
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.session_state.manual_lat = st.number_input(
+                        "ละติจูด", 
+                        value=st.session_state.manual_lat,
+                        format="%.6f"
+                    )
+                with col2:
+                    st.session_state.manual_lng = st.number_input(
+                        "ลองจิจูด",
+                        value=st.session_state.manual_lng,
+                        format="%.6f"
+                    )
+                
+                if st.button("🔄 ใช้ตำแหน่งนี้"):
+                    st.session_state.current_location = (st.session_state.manual_lat, st.session_state.manual_lng)
+                    st.success("อัพเดทตำแหน่งเรียบร้อย!")
+            
+            st.subheader("🏢 ตั้งค่าพื้นที่ทำงาน")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                work_lat = st.number_input(
+                    "ละติจูด", 
+                    value=st.session_state.work_location['lat'],
+                    format="%.6f",
+                    key="work_lat"
+                )
+            with col2:
+                work_lng = st.number_input(
+                    "ลองจิจูด",
+                    value=st.session_state.work_location['lng'],
+                    format="%.6f",
+                    key="work_lng"
+                )
+            
+            work_radius = st.slider(
+                "รัศมีพื้นที่ทำงาน (เมตร)",
+                min_value=10,
+                max_value=500,
+                value=st.session_state.work_location['radius']
+            )
+            
+            work_name = st.text_input(
+                "ชื่อสถานที่ทำงาน",
+                value=st.session_state.work_location['name']
+            )
+            
+            if st.button("💾 บันทึกการตั้งค่า", use_container_width=True):
+                st.session_state.work_location.update({
+                    'lat': work_lat,
+                    'lng': work_lng,
+                    'radius': work_radius,
+                    'name': work_name
+                })
+                st.success("บันทึกการตั้งค่าเรียบร้อย!")
+            
+            st.markdown("---")
+            
+            # การควบคุม
+            st.subheader("🎮 การควบคุม")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if not st.session_state.is_tracking:
+                    if st.button("🚀 เริ่มทำงาน", type="primary", use_container_width=True):
+                        if self.start_work_session():
+                            st.success("เริ่มบันทึกเวลาทำงานแล้ว!")
+                            time.sleep(1)
+                            st.rerun()
+                else:
+                    st.button("🚀 เริ่มทำงาน", disabled=True, use_container_width=True)
+            
+            with col2:
+                if st.session_state.is_tracking:
+                    if st.button("⏹️ หยุดทำงาน", type="secondary", use_container_width=True):
+                        if self.end_work_session():
+                            st.success("หยุดบันทึกเวลาทำงานแล้ว!")
+                            time.sleep(1)
+                            st.rerun()
+                else:
+                    st.button("⏹️ หยุดทำงาน", disabled=True, use_container_width=True)
+            
+            if st.button("🔄 อัพเดทตำแหน่ง", use_container_width=True):
+                if st.session_state.location_method == 'simulation':
+                    st.session_state.current_location = None
+                st.rerun()
+            
+            st.markdown("---")
+            
+            # สถิติ
+            st.subheader("📊 สถิติ")
+            stats = self.get_statistics()
+            
+            st.metric("⏱️ เวลาวันนี้", f"{stats['today_hours']:.2f} ชม.")
+            st.metric("📈 เวลารวม", f"{stats['total_hours']:.2f} ชม.")
+            st.metric("🔢 จำนวนครั้ง", stats['total_sessions'])
+
+    def render_location_map(self):
+        """แสดงข้อมูลตำแหน่งแบบง่าย (ไม่ใช้แผนที่)"""
+        st.subheader("🗺️ ข้อมูลตำแหน่ง")
+        
+        location = self.get_current_location()
+        if not location:
+            st.warning("ไม่สามารถดึงตำแหน่งได้")
             return
             
-        user_lat, user_lng = st.session_state.current_location
+        lat, lng = location
         work_lat = st.session_state.work_location['lat']
         work_lng = st.session_state.work_location['lng']
-        in_area, distance = self.is_in_work_area(user_lat, user_lng)
+        in_area, distance = self.is_in_work_area(lat, lng)
         
-        # สร้างข้อมูลสำหรับแผนที่
-        df = pd.DataFrame({
-            'lat': [work_lat, user_lat],
-            'lon': [work_lng, user_lng],
-            'type': ['พื้นที่ทำงาน', 'ตำแหน่งคุณ'],
-            'size': [20, 15],
-            'color': ['blue', 'green' if in_area else 'red']
-        })
+        # สร้าง visualization แบบง่ายด้วย text
+        col1, col2 = st.columns(2)
         
-        # สร้างแผนที่แบบง่าย
-        try:
-            fig = px.scatter_mapbox(
-                df,
-                lat="lat",
-                lon="lon",
-                color="type",
-                size="size",
-                color_discrete_map={
-                    'พื้นที่ทำงาน': 'blue',
-                    'ตำแหน่งคุณ': 'green' if in_area else 'red'
-                },
-                zoom=14,
-                height=300
-            )
+        with col1:
+            st.write("### 📍 ตำแหน่งปัจจุบัน")
+            st.write(f"**ละติจูด:** {lat:.6f}")
+            st.write(f"**ลองจิจูด:** {lng:.6f}")
+            st.write(f"**สถานะ:** {'✅ อยู่ในพื้นที่ทำงาน' if in_area else '⚠️ นอกพื้นที่ทำงาน'}")
+            st.write(f"**ระยะทาง:** {distance:.0f} เมตร")
+        
+        with col2:
+            st.write("### 🏢 พื้นที่ทำงาน")
+            st.write(f"**ชื่อ:** {st.session_state.work_location['name']}")
+            st.write(f"**ศูนย์กลาง:** {work_lat:.6f}, {work_lng:.6f}")
+            st.write(f"**รัศมี:** {st.session_state.work_location['radius']} เมตร")
             
-            fig.update_layout(
-                mapbox_style="open-street-map",
-                margin={"r":0,"t":0,"l":0,"b":0},
-                showlegend=True
-            )
+            # แสดงระยะทางแบบกราฟิกง่ายๆ
+            max_distance = max(distance, st.session_state.work_location['radius'])
+            progress = min(distance / st.session_state.work_location['radius'], 2.0)
             
-            st.plotly_chart(fig, use_container_width=True)
-            
-        except Exception as e:
-            st.warning(f"ไม่สามารถแสดงแผนที่ได้: {e}")
-            # แสดงข้อมูลตำแหน่งแบบตารางแทน
-            st.info(f"""
-            **ข้อมูลตำแหน่ง:**
-            - พื้นที่ทำงาน: {work_lat:.6f}, {work_lng:.6f}
-            - ตำแหน่งคุณ: {user_lat:.6f}, {user_lng:.6f}
-            - ระยะทาง: {distance:.0f} เมตร
-            - สถานะ: {'อยู่ในพื้นที่' if in_area else 'นอกพื้นที่'}
-            """)
+            if in_area:
+                st.progress(progress, text=f"อยู่ในพื้นที่ ({distance:.0f}m / {st.session_state.work_location['radius']}m)")
+            else:
+                st.progress(1.0, text=f"นอกพื้นที่ (+{distance - st.session_state.work_location['radius']:.0f}m)")
+        
+        # Visualization แบบง่ายด้วย HTML
+        st.markdown("""
+        <style>
+        .location-visualization {
+            background: #f0f2f6;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            margin: 10px 0;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        status_color = "#28a745" if in_area else "#dc3545"
+        st.markdown(f"""
+        <div class="location-visualization">
+            <h3>🎯 สถานะตำแหน่ง</h3>
+            <p style="font-size: 24px; color: {status_color}; font-weight: bold;">
+                {'✅ อยู่ในพื้นที่ทำงาน' if in_area else '⚠️ นอกพื้นที่ทำงาน'}
+            </p>
+            <p>ระยะทางจากศูนย์กลาง: <strong>{distance:.0f} เมตร</strong></p>
+            <p>รัศมีที่อนุญาต: <strong>{st.session_state.work_location['radius']} เมตร</strong></p>
+        </div>
+        """, unsafe_allow_html=True)
 
-    def render_sessions_table(self):
-        """แสดงตารางประวัติการทำงาน"""
+    def render_work_sessions(self):
+        """แสดงประวัติการทำงาน"""
+        st.subheader("📋 ประวัติการทำงาน")
+        
         if not st.session_state.work_sessions:
             st.info("ยังไม่มีประวัติการทำงาน")
             return
         
         # สร้างข้อมูลสำหรับตาราง
         sessions_data = []
-        for session in reversed(st.session_state.work_sessions[-10:]):  # 10 รายการล่าสุด
+        for session in reversed(st.session_state.work_sessions[-15:]):  # 15 รายการล่าสุด
             if session['status'] == 'completed':
                 sessions_data.append({
                     'ลำดับ': session['id'],
@@ -413,70 +404,66 @@ class WorkTimeTracker:
                 })
         
         if sessions_data:
-            df = pd.DataFrame(sessions_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            # แสดงเป็นตารางแบบง่าย
+            for session in sessions_data:
+                with st.expander(f"Session #{session['ลำดับ']} - {session['วันที่']} {session['เวลาเริ่ม']}"):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.write(f"**เริ่ม:** {session['เวลาเริ่ม']}")
+                        st.write(f"**สิ้นสุด:** {session['เวลาสิ้นสุด']}")
+                    with col2:
+                        st.write(f"**ระยะเวลา:** {session['ระยะเวลา']}")
+                        st.write(f"**สถานะ:** {session['สถานะ']}")
+                    with col3:
+                        st.write(f"**ระยะทาง:** {session['ระยะทาง (ม.)']}")
             
-            # ปุ่มจัดการข้อมูล
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("📥 ส่งออกข้อมูล CSV"):
-                    self.export_data()
-            with col2:
-                if st.button("🗑️ ล้างข้อมูลทั้งหมด", type="secondary"):
-                    if not st.session_state.is_tracking:
-                        st.session_state.work_sessions = []
-                        st.success("ล้างข้อมูลเรียบร้อย!")
-                        st.rerun()
-                    else:
-                        st.warning("กรุณาหยุดการทำงานก่อนล้างข้อมูล")
+            # สรุปข้อมูล
+            st.markdown("---")
+            self.render_session_summary()
+        else:
+            st.info("ไม่มี session ที่เสร็จสมบูรณ์")
 
-    def render_analytics(self):
-        """แสดงการวิเคราะห์ข้อมูล"""
+    def render_session_summary(self):
+        """แสดงสรุป session"""
         completed = [s for s in st.session_state.work_sessions if s['status'] == 'completed']
         
-        if len(completed) < 2:
-            st.info("ต้องการข้อมูลอย่างน้อย 2 session เพื่อแสดงการวิเคราะห์")
+        if not completed:
             return
         
-        # สร้างกราฟแท่งเวลาทำงานรายวัน
-        daily_data = []
-        for session in completed:
-            date = session['start_time'].date()
-            hours = session['duration'].total_seconds() / 3600
-            daily_data.append({'วันที่': date, 'ชั่วโมง': hours})
+        st.write("### 📊 สรุปข้อมูล")
+        cols = st.columns(4)
         
-        if daily_data:
-            df_daily = pd.DataFrame(daily_data)
-            df_daily = df_daily.groupby('วันที่')['ชั่วโมง'].sum().reset_index()
-            
-            # แสดงกราฟ
-            fig = px.bar(
-                df_daily.tail(7),  # 7 วันล่าสุด
-                x='วันที่',
-                y='ชั่วโมง',
-                title='เวลาทำงานรายวัน',
-                color='ชั่วโมง'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # สถิติเพิ่มเติม
-        col1, col2, col3 = st.columns(3)
         stats = self.get_statistics()
         
-        with col1:
+        with cols[0]:
+            st.metric("รวมเวลาทำงาน", f"{stats['total_hours']:.2f} ชม.")
+        
+        with cols[1]:
+            st.metric("เวลาวันนี้", f"{stats['today_hours']:.2f} ชม.")
+        
+        with cols[2]:
             in_area_count = len([s for s in completed if s['in_work_area']])
-            total_count = len(completed)
-            percentage = (in_area_count / total_count * 100) if total_count > 0 else 0
+            percentage = (in_area_count / len(completed)) * 100
             st.metric("ทำงานในพื้นที่", f"{percentage:.1f}%")
         
-        with col2:
-            avg_hours = stats['total_hours'] / total_count if total_count > 0 else 0
+        with cols[3]:
+            avg_hours = stats['total_hours'] / len(completed) if completed else 0
             st.metric("เฉลี่ยต่อครั้ง", f"{avg_hours:.2f} ชม.")
         
-        with col3:
-            today_target = 8.0
-            today_progress = min((stats['today_hours'] / today_target * 100), 100)
-            st.metric("ความคืบหน้าวันนี้", f"{today_progress:.1f}%")
+        # ปุ่มจัดการข้อมูล
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📥 ส่งออกข้อมูล CSV", use_container_width=True):
+                self.export_data()
+        with col2:
+            if st.button("🗑️ ล้างข้อมูลทั้งหมด", type="secondary", use_container_width=True):
+                if not st.session_state.is_tracking:
+                    st.session_state.work_sessions = []
+                    st.success("ล้างข้อมูลเรียบร้อย!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.warning("กรุณาหยุดการทำงานก่อนล้างข้อมูล")
 
     def export_data(self):
         """ส่งออกข้อมูลเป็น CSV"""
@@ -489,30 +476,52 @@ class WorkTimeTracker:
         data_list = []
         for session in completed:
             data_list.append({
+                'ลำดับ': session['id'],
                 'วันที่': session['start_time'].strftime('%Y-%m-%d'),
                 'เวลาเริ่ม': session['start_time'].strftime('%H:%M:%S'),
                 'เวลาสิ้นสุด': session['end_time'].strftime('%H:%M:%S'),
                 'ระยะเวลา (ชม.)': round(session['duration'].total_seconds() / 3600, 2),
                 'ในพื้นที่ทำงาน': 'ใช่' if session['in_work_area'] else 'ไม่',
                 'ระยะทาง (ม.)': round(session['distance'], 1),
-                'ตำแหน่ง': f"{session['location'][0]:.6f}, {session['location'][1]:.6f}"
+                'ละติจูด': session['location'][0],
+                'ลองจิจูด': session['location'][1]
             })
         
         df = pd.DataFrame(data_list)
-        csv = df.to_csv(index=False, encoding='utf-8-sig')
         
+        # สร้าง CSV ใน memory
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+        csv_string = csv_buffer.getvalue()
+        
+        # ปุ่มดาวน์โหลด
         st.download_button(
-            label="📥 ดาวน์โหลด CSV",
-            data=csv,
-            file_name=f"work_time_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
+            label="📥 ดาวน์โหลดไฟล์ CSV",
+            data=csv_string,
+            file_name=f"work_time_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True
         )
+        
+        # แสดงตัวอย่างข้อมูล
+        st.write("### ตัวอย่างข้อมูลที่จะส่งออก:")
+        st.dataframe(df.head(), use_container_width=True)
 
     def main(self):
         """ฟังก์ชันหลัก"""
         try:
+            # Render หน้าเว็บ
+            self.render_header()
             self.render_sidebar()
-            self.render_main_content()
+            
+            # เนื้อหาหลัก
+            tab1, tab2 = st.tabs(["📍 สถานะตำแหน่ง", "📋 ประวัติการทำงาน"])
+            
+            with tab1:
+                self.render_location_map()
+            
+            with tab2:
+                self.render_work_sessions()
             
             # Auto-refresh ถ้ากำลังทำงาน
             if st.session_state.is_tracking:
@@ -521,7 +530,7 @@ class WorkTimeTracker:
                 
         except Exception as e:
             st.error(f"เกิดข้อผิดพลาด: {str(e)}")
-            st.info("โปรดรีเฟรชหน้าเว็บหรือตรวจสอบการเชื่อมต่อ")
+            st.info("โปรดรีเฟรชหน้าเว็บ")
 
 # รันแอพพลิเคชัน
 if __name__ == "__main__":
